@@ -6,7 +6,7 @@ use std::rc::Rc;
 use biome_analyze::{
     AddVisitor, DiagnosticSignal, FromServices, Phase, Phases, QueryMatch, Queryable, RuleCategory,
     RuleKey, RuleMetadata, ServiceBag, ServicesDiagnostic, SignalEntry, SignalRuleKey, Visitor,
-    VisitorContext,
+    VisitorContext, options::TailwindOptions,
 };
 use biome_console::markup;
 use biome_diagnostics::{Diagnostic, MessageAndDescription, panic::catch_unwind};
@@ -176,7 +176,11 @@ fn parse_with_inner(
 }
 
 pub trait TailwindClassStringHost: AstNode {
-    fn tailwind_class_string(&self, is_class_attribute: bool) -> Option<TailwindClassString>;
+    fn tailwind_class_string(
+        &self,
+        options: &TailwindOptions,
+        is_class_attribute: bool,
+    ) -> Option<TailwindClassString>;
 }
 
 #[derive(Clone)]
@@ -185,11 +189,14 @@ pub struct TailwindSyntax<N> {
     parse: Rc<TailwindParse>,
 }
 
-pub struct TailwindSyntaxMatch<L: Language>(SyntaxNode<L>);
+pub struct TailwindSyntaxMatch<L: Language> {
+    node: SyntaxNode<L>,
+    class_string: TailwindClassString,
+}
 
 impl<L: Language + 'static> QueryMatch for TailwindSyntaxMatch<L> {
     fn text_range(&self) -> TextRange {
-        self.0.text_trimmed_range()
+        self.node.text_trimmed_range()
     }
 }
 
@@ -262,22 +269,17 @@ where
     }
 
     fn unwrap_match(services: &ServiceBag, node: &Self::Input) -> Self::Output {
-        let node = N::unwrap_cast(node.0.clone());
-        let class_string = node
-            .tailwind_class_string(
-                services
-                    .get_service::<JsFileSource>()
-                    .is_some_and(|source| source.as_embedding_kind().is_class_attribute()),
-            )
-            // SAFETY: The visitor emits matches only for nodes that host a Tailwind class string.
-            .expect("TailwindSyntaxVisitor only emits Tailwind class strings");
+        let ast_node = N::unwrap_cast(node.node.clone());
         let parse = services
             .get_service::<TwSyntaxService>()
             // SAFETY: TailwindSyntaxServices requires this service before the rule can run.
             .expect("TwSyntaxService service is not registered")
-            .parse_for_query(&class_string);
+            .parse_for_query(&node.class_string);
 
-        Self { node, parse }
+        Self {
+            node: ast_node,
+            parse,
+        }
     }
 }
 
@@ -333,6 +335,7 @@ where
             return;
         };
         let Some(class_string) = ast_node.tailwind_class_string(
+            ctx.options.tailwind(),
             ctx.services
                 .get_service::<JsFileSource>()
                 .is_some_and(|source| source.as_embedding_kind().is_class_attribute()),
@@ -356,7 +359,10 @@ where
         if parsed.should_emit_diagnostics {
             emit_parse_diagnostics(&mut ctx, &class_string, parsed.parse.diagnostics());
         }
-        ctx.match_query(TailwindSyntaxMatch(node.clone()));
+        ctx.match_query(TailwindSyntaxMatch {
+            node: node.clone(),
+            class_string,
+        });
     }
 }
 
@@ -384,12 +390,113 @@ fn emit_parse_diagnostics<L: Language>(
     }
 }
 
+fn matches_function_pattern(pattern: &str, name: &str) -> bool {
+    let mut pattern_parts = pattern.split('.');
+    let mut name_parts = name.split('.');
+    let all_parts_match = pattern_parts
+        .by_ref()
+        .zip(name_parts.by_ref())
+        .all(|(pattern, name)| pattern == "*" || pattern == name);
+    all_parts_match && pattern_parts.next().is_none() && name_parts.next().is_none()
+}
+
 const DEFAULT_FUNCTIONS: [&str; 10] = [
     "clsx", "tw", "twMerge", "twJoin", "cva", "tv", "cn", "cc", "cnb", "ctl",
 ];
 
-fn is_default_function(name: &str) -> bool {
-    DEFAULT_FUNCTIONS.contains(&name)
+fn is_tailwind_function(options: &TailwindOptions, name: &str) -> bool {
+    if let Some(functions) = options.functions() {
+        functions
+            .iter()
+            .any(|pattern| matches_function_pattern(pattern, name))
+    } else {
+        DEFAULT_FUNCTIONS
+            .iter()
+            .any(|pattern| matches_function_pattern(pattern, name))
+    }
+}
+
+fn matches_static_member_function_pattern(
+    pattern: &str,
+    static_member_expression: &JsStaticMemberExpression,
+) -> bool {
+    let mut current = static_member_expression.clone();
+
+    if !pattern.contains('.') {
+        loop {
+            let Ok(object) = current.object() else {
+                return false;
+            };
+            if let Some(identifier) = object.as_js_identifier_expression() {
+                let Ok(name) = identifier.name() else {
+                    return false;
+                };
+                let Ok(name) = name.name() else {
+                    return false;
+                };
+                return pattern == "*" || pattern == name.text();
+            }
+            let Some(static_member) = object.as_js_static_member_expression() else {
+                return false;
+            };
+            current = static_member.clone();
+        }
+    }
+
+    let mut pattern_parts = pattern.rsplit('.');
+    loop {
+        let Some(pattern_part) = pattern_parts.next() else {
+            return false;
+        };
+        let Ok(member) = current.member() else {
+            return false;
+        };
+        let Some(member) = member.as_js_name() else {
+            return false;
+        };
+        let Ok(member) = member.value_token() else {
+            return false;
+        };
+        if pattern_part != "*" && pattern_part != member.text_trimmed() {
+            return false;
+        }
+
+        let Ok(object) = current.object() else {
+            return false;
+        };
+        if let Some(identifier) = object.as_js_identifier_expression() {
+            let Ok(name) = identifier.name() else {
+                return false;
+            };
+            let Ok(name) = name.name() else {
+                return false;
+            };
+            let Some(pattern_part) = pattern_parts.next() else {
+                return false;
+            };
+            return (pattern_part == "*" || pattern_part == name.text())
+                && pattern_parts.next().is_none();
+        }
+        let Some(static_member) = object.as_js_static_member_expression() else {
+            return false;
+        };
+        current = static_member.clone();
+    }
+}
+
+fn is_tailwind_static_member_function(
+    options: &TailwindOptions,
+    static_member_expression: &JsStaticMemberExpression,
+) -> bool {
+    if let Some(functions) = options.functions() {
+        functions.iter().any(|pattern| {
+            matches_static_member_function_pattern(pattern, static_member_expression)
+        })
+    } else {
+        DEFAULT_FUNCTIONS.iter().any(|pattern| {
+            matches_static_member_function_pattern(pattern, static_member_expression)
+        })
+    }
 }
 
 fn get_callee_name(call_expression: &JsCallExpression) -> Option<TokenText> {
@@ -403,25 +510,28 @@ fn get_callee_name(call_expression: &JsCallExpression) -> Option<TokenText> {
         .ok()
 }
 
-fn is_call_expression_of_default_function(call_expression: &JsCallExpression) -> bool {
-    get_callee_name(call_expression).is_some_and(|name| is_default_function(name.text()))
+fn is_call_expression_of_configured_function(
+    call_expression: &JsCallExpression,
+    options: &TailwindOptions,
+) -> bool {
+    if let Some(name) = get_callee_name(call_expression) {
+        return is_tailwind_function(options, name.text());
+    }
+
+    let Ok(callee) = call_expression.callee() else {
+        return false;
+    };
+    let Some(callee) = callee.as_js_static_member_expression() else {
+        return false;
+    };
+    is_tailwind_static_member_function(options, callee)
 }
 
-fn is_static_member_expression_of_default_function(
+fn is_static_member_expression_of_configured_function(
     static_member_expression: &JsStaticMemberExpression,
-) -> Option<bool> {
-    let mut current = static_member_expression.object().ok()?;
-    loop {
-        if let Some(identifier) = current.as_js_identifier_expression() {
-            let name = identifier.name().ok()?.name().ok()?;
-            return Some(is_default_function(name.text()));
-        }
-        if let Some(static_member) = current.as_js_static_member_expression() {
-            current = static_member.object().ok()?;
-            continue;
-        }
-        return Some(false);
-    }
+    options: &TailwindOptions,
+) -> bool {
+    is_tailwind_static_member_function(options, static_member_expression)
 }
 
 fn get_jsx_attribute_name(attribute: &JsxAttribute) -> Option<TokenText> {
@@ -436,8 +546,15 @@ fn get_jsx_attribute_name(attribute: &JsxAttribute) -> Option<TokenText> {
     )
 }
 
-fn is_class_attribute_name(name: &str) -> bool {
-    matches!(name, "class" | "className")
+fn is_configured_attribute(options: &TailwindOptions, name: &str) -> bool {
+    options.attributes().map_or_else(
+        || matches!(name, "class" | "className"),
+        |attributes| {
+            attributes
+                .iter()
+                .any(|attribute| attribute.as_ref() == name)
+        },
+    )
 }
 
 const CLASS_CONFIGURATION_WRAPPER_KINDS: SyntaxKindSet<JsLanguage> = JsObjectMemberList::KIND_SET
@@ -473,7 +590,10 @@ fn is_class_preserving_spread(
     }
 }
 
-fn is_class_configuration_value(member: &JsPropertyObjectMember) -> Option<bool> {
+fn is_class_configuration_value(
+    member: &JsPropertyObjectMember,
+    options: &TailwindOptions,
+) -> Option<bool> {
     let mut path = Vec::new();
     let mut collection_kind = None;
     let mut child = member.syntax().clone();
@@ -525,6 +645,9 @@ fn is_class_configuration_value(member: &JsPropertyObjectMember) -> Option<bool>
                     "tv" => 0,
                     _ => return None,
                 };
+                if !is_tailwind_function(options, name.text()) {
+                    return None;
+                }
                 let config = call
                     .arguments()
                     .ok()?
@@ -542,7 +665,7 @@ fn is_class_configuration_value(member: &JsPropertyObjectMember) -> Option<bool>
                     [_, _, _, variants] => name.text() == "tv" && variants.text() == "variants",
                     [class, compound_variants] | [_, class, compound_variants] => {
                         (path.len() == 2 || name.text() == "tv")
-                            && is_class_attribute_name(class.text())
+                            && matches!(class.text(), "class" | "className")
                             && (compound_variants.text() == "compoundVariants"
                                 || name.text() == "tv"
                                     && compound_variants.text() == "compoundSlots")
@@ -566,7 +689,11 @@ fn is_class_configuration_value(member: &JsPropertyObjectMember) -> Option<bool>
     None
 }
 
-fn inspect_string_literal(node: &SyntaxNode<JsLanguage>, is_class_attribute: bool) -> Option<bool> {
+fn inspect_string_literal(
+    node: &SyntaxNode<JsLanguage>,
+    options: &TailwindOptions,
+    is_class_attribute: bool,
+) -> Option<bool> {
     let mut child = node.clone();
     let mut collection_kind = None;
     for ancestor in node.ancestors().skip(1) {
@@ -609,9 +736,9 @@ fn inspect_string_literal(node: &SyntaxNode<JsLanguage>, is_class_attribute: boo
             JsSyntaxKind::JS_PROPERTY_OBJECT_MEMBER => {
                 let member = JsPropertyObjectMember::cast_ref(&ancestor)?;
                 if member.name().ok()?.syntax() != &child {
-                    return is_class_configuration_value(&member);
+                    return is_class_configuration_value(&member, options);
                 }
-                if is_class_configuration_value(&member).unwrap_or(false) {
+                if is_class_configuration_value(&member, options).unwrap_or(false) {
                     return None;
                 }
             }
@@ -623,7 +750,8 @@ fn inspect_string_literal(node: &SyntaxNode<JsLanguage>, is_class_attribute: boo
             }
             JsSyntaxKind::JSX_ATTRIBUTE => {
                 let attribute = JsxAttribute::cast_ref(&ancestor)?;
-                return Some(is_class_attribute_name(
+                return Some(is_configured_attribute(
+                    options,
                     get_jsx_attribute_name(&attribute)?.text(),
                 ));
             }
@@ -631,7 +759,7 @@ fn inspect_string_literal(node: &SyntaxNode<JsLanguage>, is_class_attribute: boo
                 let call = JsCallExpression::cast_ref(&ancestor)?;
                 return Some(
                     JsCallArguments::can_cast(child.kind())
-                        && is_call_expression_of_default_function(&call),
+                        && is_call_expression_of_configured_function(&call, options),
                 );
             }
             JsSyntaxKind::JS_TEMPLATE_EXPRESSION => {
@@ -642,12 +770,13 @@ fn inspect_string_literal(node: &SyntaxNode<JsLanguage>, is_class_attribute: boo
                 let template = JsTemplateExpression::cast_ref(&ancestor)?;
                 if let Some(tag) = template.tag() {
                     return match tag {
-                        AnyJsExpression::JsIdentifierExpression(tag) => {
-                            Some(is_default_function(tag.name().ok()?.name().ok()?.text()))
-                        }
-                        AnyJsExpression::JsStaticMemberExpression(tag) => {
-                            is_static_member_expression_of_default_function(&tag)
-                        }
+                        AnyJsExpression::JsIdentifierExpression(tag) => Some(is_tailwind_function(
+                            options,
+                            tag.name().ok()?.name().ok()?.text(),
+                        )),
+                        AnyJsExpression::JsStaticMemberExpression(tag) => Some(
+                            is_static_member_expression_of_configured_function(&tag, options),
+                        ),
                         _ => None,
                     };
                 }
@@ -688,8 +817,12 @@ fn tailwind_class_string(
 }
 
 impl TailwindClassStringHost for JsStringLiteralExpression {
-    fn tailwind_class_string(&self, is_class_attribute: bool) -> Option<TailwindClassString> {
-        if !inspect_string_literal(self.syntax(), is_class_attribute).unwrap_or(false) {
+    fn tailwind_class_string(
+        &self,
+        options: &TailwindOptions,
+        is_class_attribute: bool,
+    ) -> Option<TailwindClassString> {
+        if !inspect_string_literal(self.syntax(), options, is_class_attribute).unwrap_or(false) {
             return None;
         }
         tailwind_class_string(
@@ -702,8 +835,12 @@ impl TailwindClassStringHost for JsStringLiteralExpression {
 }
 
 impl TailwindClassStringHost for JsLiteralMemberName {
-    fn tailwind_class_string(&self, is_class_attribute: bool) -> Option<TailwindClassString> {
-        if !inspect_string_literal(self.syntax(), is_class_attribute).unwrap_or(false) {
+    fn tailwind_class_string(
+        &self,
+        options: &TailwindOptions,
+        is_class_attribute: bool,
+    ) -> Option<TailwindClassString> {
+        if !inspect_string_literal(self.syntax(), options, is_class_attribute).unwrap_or(false) {
             return None;
         }
         tailwind_class_string(
@@ -716,14 +853,18 @@ impl TailwindClassStringHost for JsLiteralMemberName {
 }
 
 impl TailwindClassStringHost for JsxString {
-    fn tailwind_class_string(&self, _is_class_attribute: bool) -> Option<TailwindClassString> {
+    fn tailwind_class_string(
+        &self,
+        options: &TailwindOptions,
+        _is_class_attribute: bool,
+    ) -> Option<TailwindClassString> {
         let jsx_attribute = self
             .syntax()
             .ancestors()
             .skip(1)
             .find_map(JsxAttribute::cast)?;
         let name = get_jsx_attribute_name(&jsx_attribute)?;
-        if !is_class_attribute_name(name.text()) {
+        if !is_configured_attribute(options, name.text()) {
             return None;
         }
         tailwind_class_string(
@@ -736,8 +877,12 @@ impl TailwindClassStringHost for JsxString {
 }
 
 impl TailwindClassStringHost for JsTemplateChunkElement {
-    fn tailwind_class_string(&self, is_class_attribute: bool) -> Option<TailwindClassString> {
-        if !inspect_string_literal(self.syntax(), is_class_attribute).unwrap_or(false) {
+    fn tailwind_class_string(
+        &self,
+        options: &TailwindOptions,
+        is_class_attribute: bool,
+    ) -> Option<TailwindClassString> {
+        if !inspect_string_literal(self.syntax(), options, is_class_attribute).unwrap_or(false) {
             return None;
         }
         let token = self.template_chunk_token().ok()?;
@@ -750,9 +895,21 @@ impl TailwindClassStringHost for JsTemplateChunkElement {
 }
 
 impl TailwindClassStringHost for HtmlAttribute {
-    fn tailwind_class_string(&self, _is_class_attribute: bool) -> Option<TailwindClassString> {
+    fn tailwind_class_string(
+        &self,
+        options: &TailwindOptions,
+        _is_class_attribute: bool,
+    ) -> Option<TailwindClassString> {
         let name = self.name().ok()?.value_token().ok()?;
-        if !name.text_trimmed().eq_ignore_ascii_case("class") {
+        let is_tailwind_attribute = options.attributes().map_or_else(
+            || name.text_trimmed().eq_ignore_ascii_case("class"),
+            |attributes| {
+                attributes
+                    .iter()
+                    .any(|attribute| attribute.as_ref().eq_ignore_ascii_case(name.text_trimmed()))
+            },
+        );
+        if !is_tailwind_attribute {
             return None;
         }
         let html_string = self.html_string()?;
