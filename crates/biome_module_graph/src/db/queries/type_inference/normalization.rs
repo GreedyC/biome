@@ -84,6 +84,7 @@ fn type_needs_normalization(ty: InferredTypeData<'_>) -> bool {
         InferredTypeData::InstanceOf(_)
             | InferredTypeData::IndexedAccess(_)
             | InferredTypeData::MappedType(_)
+            | InferredTypeData::Extends(_)
             | InferredTypeData::TypeOperator(_)
             | InferredTypeData::Intersection(_)
             | InferredTypeData::Local(_)
