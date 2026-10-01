@@ -1,5 +1,26 @@
 # @biomejs/biome
 
+## 2.5.16
+
+### Patch Changes
+
+- [#12066](https://github.com/biomejs/biome/pull/12066) [`d13d1ba`](https://github.com/biomejs/biome/commit/d13d1ba6c82da9593856bc69e35d7af5ae92c209) Thanks [@dyc3](https://github.com/dyc3)! - Updated rule source metadata.
+
+- [#11563](https://github.com/biomejs/biome/pull/11563) [`a4e6528`](https://github.com/biomejs/biome/commit/a4e6528a4a0ff0405d159b5ada0e30f8f2c759e2) Thanks [@santichausis](https://github.com/santichausis)! - Fixed [#11419](https://github.com/biomejs/biome/issues/11419): [`noAdjacentSpacesInRegex`](https://biomejs.dev/linter/rules/no-adjacent-spaces-in-regex/) no longer applies its fix inside a regex character class (`[...]`), where it was changing what the class matches instead of just clarifying the spacing.
+  
+  For example, Biome used to "fix" this regex into matching different characters:
+  
+  ```js
+  const before = /[\s   ]/;
+  // Biome used to rewrite this to /[\s {3}]/, which is a different regex:
+  // {3} isn't a quantifier inside a character class, it's three more
+  // characters to match — the fixed regex now also matches "1", "2", "{", "}".
+  ```
+  
+  Adjacent spaces outside a character class are still merged into a quantifier as before.
+
+- [#12063](https://github.com/biomejs/biome/pull/12063) [`8724a5d`](https://github.com/biomejs/biome/commit/8724a5dda6b444f8e6a56f8344e5ab9e7f6ebaa9) Thanks [@dyc3](https://github.com/dyc3)! - Fixed [#9749](https://github.com/biomejs/biome/issues/9749): in GritQL plugins and `biome search`, a `contains` followed by further conditions now tries every node it matches, instead of failing when the first match doesn't satisfy the remaining conditions.
+
 ## 2.5.15
 
 ### Patch Changes
