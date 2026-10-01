@@ -526,8 +526,16 @@ fn test_member_lookup_selects_conditional_branch_lazily() {
     ] {
         let ty = inferred_function_return_ty_by_name(&db, module, inferred, function).unwrap();
         let value = inferred.find_member_type(&db, ty, "value").unwrap();
-        assert_eq!(contains_inferred_string(&db, value), has_string, "{function}");
-        assert_eq!(contains_inferred_number(&db, value), has_number, "{function}");
+        assert_eq!(
+            contains_inferred_string(&db, value),
+            has_string,
+            "{function}"
+        );
+        assert_eq!(
+            contains_inferred_number(&db, value),
+            has_number,
+            "{function}"
+        );
     }
 }
 
